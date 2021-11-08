@@ -149,7 +149,7 @@ if args.fp16:
 from datasets import load_dataset
 from transformers import AutoTokenizer, DataCollatorWithPadding
 
-raw_datasets = load_dataset('csv', data_files='training_character_base.csv')
+raw_datasets = load_dataset('csv', data_files={"train": "training_character_base.csv", "eval": "training_character_base.csv"})
 checkpoint = "t5-3b"
 tokenizer = AutoTokenizer.from_pretrained(checkpoint, additional_special_tokens=['[Prompt]'], extra_ids=0)
 # tokenizer.vocab_size = tokenizer.vocab_size+1
@@ -164,7 +164,7 @@ tokenized_datasets = raw_datasets.map(tokenize_function, batched=True)
 
 tokenized_datasets2 = raw_datasets.map(tokenize_function2, batched=True)
 
-for t in ['train']:
+for t in ['train', 'eval']:
   tokenized_datasets[t] = tokenized_datasets[t].add_column('labels', tokenized_datasets2[t]['input_ids'])
   tokenized_datasets[t] = tokenized_datasets[t].add_column('decoder_input_ids', tokenized_datasets2[t]['input_ids'])
   tokenized_datasets[t] = tokenized_datasets[t].add_column('decoder_attention_mask', tokenized_datasets2[t]['input_ids'])
