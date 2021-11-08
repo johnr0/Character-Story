@@ -150,7 +150,7 @@ from datasets import load_dataset
 from transformers import AutoTokenizer, DataCollatorWithPadding
 
 raw_datasets = load_dataset('csv', data_files={"train": "training_character_base.csv", "eval": "training_character_base.csv"})
-checkpoint = "t5-3b"
+checkpoint = "t5-small"
 tokenizer = AutoTokenizer.from_pretrained(checkpoint, additional_special_tokens=['[Prompt]'], extra_ids=0)
 # tokenizer.vocab_size = tokenizer.vocab_size+1
 
