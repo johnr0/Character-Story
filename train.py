@@ -1,6 +1,10 @@
 from transformers import AutoModelWithLMHead, AutoTokenizer, AutoModelForCausalLM, AutoModelForSeq2SeqLM, AdamW, AutoConfig
 from prompt_embedding import PROMPTEmbedding
 import torch
+import argparse
+import deepspeed
+
+parser = argparse.ArgumentParser()
 
 
 ## Required parameters
@@ -13,8 +17,8 @@ parser.add_argument("--output_dir", default=None, type=str, required=True,
 parser.add_argument("--eval_data_file", default=None, type=str,
                     help="An optional input evaluation data file to evaluate the perplexity on (a text file).")
 
-# parser.add_argument("--model_type", default="bert", type=str,
-#                     help="The model architecture to be fine-tuned.")
+parser.add_argument("--model_name", default="t5-small", type=str,
+                    help="The model architecture to be fine-tuned.")
 # parser.add_argument("--model_name_or_path", default="bert-base-cased", type=str,
 #                     help="The model checkpoint for weights initialization.")
 
@@ -95,12 +99,13 @@ parser.add_argument("--local_rank", type=int, default=-1,
                     help="For distributed training: local_rank")
 parser.add_argument('--server_ip', type=str, default='', help="For distant debugging.")
 parser.add_argument('--server_port', type=str, default='', help="For distant debugging.")
+parser = deepspeed.add_config_arguments(parser)
 args = parser.parse_args()
 
-
+model_name = args.model_name
 
 ####################### Load model and tokenizer #######################
-model_name = "t5-3b"
+
 model = AutoModelForSeq2SeqLM.from_pretrained(model_name)
 tokenizer = AutoTokenizer.from_pretrained(model_name)
 config = AutoConfig.from_pretrained(model_name)
@@ -130,12 +135,15 @@ for param in model.parameters():
     param.requires_grad = False
     if param.size(0)==sum(n_tokens1):
       param.requires_grad = True
+      print('token1')
     if param.size(0)==sum(n_tokens2):
       param.requires_grad = True
+      print('token2')
 
 
 #################### Setting optimizer #####################
 optimizer = AdamW(params = filter(lambda p: p.requires_grad, model.parameters()), lr=args.learning_rate, eps=args.adam_epsilon)
+
 
 if args.fp16:
         try:
@@ -144,30 +152,44 @@ if args.fp16:
             raise ImportError("Please install apex from https://www.github.com/nvidia/apex to use fp16 training.")
         model, optimizer = amp.initialize(model, optimizer, opt_level=args.fp16_opt_level)
 
+# model_engine, optimizer, _, _ = deepspeed.initialize(args=args,
+#                                                      model=model,
+#                                                      model_parameters=params)
+
 
 ####################### Load data #######################
 from datasets import load_dataset
 from transformers import AutoTokenizer, DataCollatorWithPadding
 
-raw_datasets = load_dataset('csv', data_files={"train": "training_character_base.csv", "eval": "training_character_base.csv"})
-checkpoint = "t5-small"
+raw_datasets = load_dataset('csv', data_files={"train": "training_character_train.csv", "eval": "training_character_eval.csv"})
+checkpoint = model_name
 tokenizer = AutoTokenizer.from_pretrained(checkpoint, additional_special_tokens=['[Prompt]'], extra_ids=0)
 # tokenizer.vocab_size = tokenizer.vocab_size+1
 
 def tokenize_function(example):
-    return tokenizer(example["input"], truncation=True, padding=True)
+    return tokenizer(example["input"], truncation=True, padding='max_length')
 
 def tokenize_function2(example):
-    return tokenizer(example["output"], truncation=True, padding=True)
+    return tokenizer(example["output"], truncation=True, padding='max_length')
 
 tokenized_datasets = raw_datasets.map(tokenize_function, batched=True)
 
 tokenized_datasets2 = raw_datasets.map(tokenize_function2, batched=True)
 
+# print('t len:', len(tokenized_datasets['train']['input_ids'][0]))
+# print('e len:', len(tokenized_datasets['eval']['input_ids'][0]))
+
+# print('t len:', len(tokenized_datasets['train']['input_ids'][1]))
+# print('e len:', len(tokenized_datasets['eval']['input_ids'][1]))
+
+# print('t len:', len(tokenized_datasets2['train']['input_ids'][0]))
+# print('e len:', len(tokenized_datasets2['eval']['input_ids'][0]))
+
+
 for t in ['train', 'eval']:
   tokenized_datasets[t] = tokenized_datasets[t].add_column('labels', tokenized_datasets2[t]['input_ids'])
-  tokenized_datasets[t] = tokenized_datasets[t].add_column('decoder_input_ids', tokenized_datasets2[t]['input_ids'])
-  tokenized_datasets[t] = tokenized_datasets[t].add_column('decoder_attention_mask', tokenized_datasets2[t]['input_ids'])
+#   tokenized_datasets[t] = tokenized_datasets[t].add_column('decoder_input_ids', tokenized_datasets2[t]['input_ids'])
+  tokenized_datasets[t] = tokenized_datasets[t].add_column('decoder_attention_mask', tokenized_datasets2[t]['attention_mask'])
 
 tokenized_datasets = tokenized_datasets.remove_columns(['Unnamed: 0', 'input', 'output'])
 
@@ -176,60 +198,108 @@ data_collator = DataCollatorWithPadding(tokenizer=tokenizer)
 tokenized_datasets.set_format("torch")
 
 from torch.utils.data import DataLoader
+from transformers import get_scheduler
 
 train_dataloader = DataLoader(
     tokenized_datasets["train"], shuffle=True, batch_size=args.per_gpu_train_batch_size, collate_fn=data_collator
 )
-
-eval_dataloader = DataLoader(
-    tokenized_datasets["eval"], shuffle=True, batch_size=args.per_gpu_eval_batch_size, collate_fn=data_collator
-)
-
-#################### Training ########################
-from tqdm.auto import tqdm
-
-from transformers import get_scheduler
 
 num_epochs = args.num_train_epochs
 num_training_steps = num_epochs * len(train_dataloader)
 lr_scheduler = get_scheduler(
     "linear",
     optimizer=optimizer,
-    num_warmup_steps=0,
+    num_warmup_steps=int(num_training_steps)/20,
     num_training_steps=num_training_steps
 )
-print(num_training_steps)
-
-progress_bar = tqdm(range(num_training_steps))
 
 
-for epoch in range(num_epochs):
-    model.train()
-    for step, batch in enumerate(train_dataloader):
-        batch = {k: v.to(device) for k, v in batch.items()}
-        outputs = model(**batch)
-        loss = outputs.loss
-        loss.backward()
+from transformers import TrainingArguments, Trainer
+
+training_args = TrainingArguments(output_dir='./', 
+    per_device_train_batch_size=args.per_gpu_train_batch_size,
+    # train_micro_batch_size=args.per_gpu_train_batch_size,
+    per_device_eval_batch_size=args.per_gpu_eval_batch_size, 
+    # eval_micro_batch_size=args.per_gpu_eval_batch_size,
+    evaluation_strategy='steps',
+    eval_steps = args.save_steps,
+    save_strategy='steps', 
+    save_steps = args.save_steps, 
+    max_grad_norm=1.0, 
+    # deepspeed = args.deepspeed_config,
+    num_train_epochs=args.num_train_epochs,
+    )
+
+trainer = Trainer(
+    model=model,
+    args=training_args,
+    train_dataset=tokenized_datasets['train'],
+    eval_dataset=tokenized_datasets['eval'],
+    data_collator = data_collator, 
+    optimizers= (optimizer, lr_scheduler)
+)
+trainer.train()
+eval_result = trainer.evaluate()
+print(eval_result)
+torch.save(model.encoder.embed_tokens, 'encoder_tokens.pt')
+torch.save(model.decoder.embed_tokens, 'decoder_tokens.pt')
+
+# eval_dataloader = DataLoader(
+#     tokenized_datasets["eval"], shuffle=True, batch_size=args.per_gpu_eval_batch_size, collate_fn=data_collator
+# )
+
+# #################### Training ########################
+# from tqdm.auto import tqdm
+
+# 
+
+
+
+
+
+
+# num_epochs = args.num_train_epochs
+# num_training_steps = num_epochs * len(train_dataloader)
+# lr_scheduler = get_scheduler(
+#     "linear",
+#     optimizer=optimizer,
+#     num_warmup_steps=0,
+#     num_training_steps=num_training_steps
+# )
+# print(num_training_steps)
+
+# progress_bar = tqdm(range(int(num_training_steps)))
+# training_args = TrainingArguments(..., deepspeed="ds_config_zero3.json")
+# trainer = Trainer(...)
+# trainer.train()
+
+# for epoch in range(int(num_epochs)):
+#     model.train()
+#     for step, batch in enumerate(train_dataloader):
+#         batch = {k: v.to(device) for k, v in batch.items()}
+#         outputs = model(**batch)
+#         loss = outputs.loss
+#         loss.backward()
         
-        optimizer.step()
-        lr_scheduler.step()
-        optimizer.zero_grad()
-        progress_bar.update(1)
-        if step%args.save_steps==0:
-            print('step {step} loss:', loss.item())
-            torch.save(model.encoder.embed_tokens, 'encoder_tokens_{step}.pt')
-            torch.save(model.decoder.embed_tokens, 'decoder_tokens_{step}.pt')
+#         optimizer.step()
+#         lr_scheduler.step()
+#         optimizer.zero_grad()
+#         progress_bar.update(1)
+#         if (step+1)%args.save_steps==0:
+#             print('step', step, 'loss:', loss.item())
+#             torch.save(model.encoder.embed_tokens, 'encoder_tokens_{step}.pt')
+#             torch.save(model.decoder.embed_tokens, 'decoder_tokens_{step}.pt')
     
-    model.eval()
-    sum_loss = 0
-    steps = 0
-    for step, batch in enumerate(eval_dataloader):
-        batch = {k: v.to(device) for k, v in batch.items()}
-        with torch.no_grad():
-            outputs = model(**batch)
-        loss = outputs.loss
-        sum_loss += loss.item()
-        steps += 1
-    torch.save(model.encoder.embed_tokens, 'encoder_tokens.pt')
-    torch.save(model.decoder.embed_tokens, 'decoder_tokens.pt')
-    print('epoch {epoch} loss:', sum_loss/steps)
+#     model.eval()
+#     sum_loss = 0
+#     steps = 0
+#     for step, batch in enumerate(eval_dataloader):
+#         batch = {k: v.to(device) for k, v in batch.items()}
+#         with torch.no_grad():
+#             outputs = model(**batch)
+#         loss = outputs.loss
+#         sum_loss += loss.item()
+#         steps += 1
+#     torch.save(model.encoder.embed_tokens, 'encoder_tokens.pt')
+#     torch.save(model.decoder.embed_tokens, 'decoder_tokens.pt')
+#     print('epoch', epoch, 'loss:', sum_loss/steps)
